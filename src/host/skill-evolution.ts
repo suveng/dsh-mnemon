@@ -54,6 +54,8 @@ const MAX_CONSECUTIVE_FAILURES = 3
 /** Backtest children run this many cases at once. */
 /** One retry for a case whose run failed rather than scored. */
 const CASE_ATTEMPTS = 2
+/** How many times an automatic adoption redrafts a skill whose backtest still regresses. */
+const AUTO_ADOPT_REDRAFTS = 2
 const BACKTEST_CONCURRENCY = 2
 
 interface PreStepPayload { step: number; signal: AbortSignal }
@@ -76,6 +78,34 @@ export function retryingSource(source: SkillsSourcePort, attempts = 4): SkillsSo
       }
     },
   }
+}
+
+export interface RunComparison {
+  baseline?: number
+  candidate?: number
+  /** Cases at most one side graded; they say nothing about the change. */
+  excluded: number
+  /** Both sides graded at least one shared case. */
+  measured: boolean
+  regressed: boolean
+}
+
+/**
+ * The comparison the page shows: mean scores over the cases both runs graded,
+ * leaving a case one side could not run out on both sides.
+ */
+export function compareBacktestRuns(baseline: BacktestRun | undefined, candidate: BacktestRun | undefined): RunComparison {
+  if (baseline?.status !== 'completed' || candidate?.status !== 'completed') return { excluded: 0, measured: false, regressed: false }
+  const graded = (run: BacktestRun) => new Map(run.results.filter(result => result.verdict !== 'error').map(result => [result.caseId, result.score]))
+  const base = graded(baseline)
+  const next = graded(candidate)
+  const shared = [...next.keys()].filter(id => base.has(id))
+  const excluded = new Set([...baseline.results, ...candidate.results].map(result => result.caseId)).size - shared.length
+  if (shared.length === 0) return { excluded, measured: false, regressed: false }
+  const mean = (scores: Map<string, number>) => shared.reduce((sum, id) => sum + scores.get(id)!, 0) / shared.length
+  const baselineScore = mean(base)
+  const candidateScore = mean(next)
+  return { baseline: baselineScore, candidate: candidateScore, excluded, measured: true, regressed: candidateScore < baselineScore }
 }
 
 function message(error: unknown): string {
@@ -124,6 +154,8 @@ function newSkillRoot(settings: ResolvedSkillsConfig, source: SkillsSourcePort, 
 export class SkillEvolution {
   private readonly sessions = new Map<string, SessionState>()
   private readonly jobs = new Set<AbortController>()
+  /** Backtests under way, so an automatic adoption can wait for its own runs. */
+  private readonly runs = new Map<string, Promise<BacktestRun | undefined>>()
   private disposed = false
 
   constructor(private readonly host: SkillEvolutionHost) {}
@@ -322,6 +354,10 @@ export class SkillEvolution {
       } satisfies ReviewRecordInput)
       state.failures = 0
       state.lastReviewAt = this.now().getTime()
+      // A review that found something can carry it to an adopted skill on its own.
+      if (current.autoAdopt && result.suggestionIds.length > 0) {
+        this.background('skill auto-adopt', signal => this.autopilot(source, workspace, result, signal))
+      }
       return result
     } catch (error) {
       state.failures += 1
@@ -346,10 +382,10 @@ export class SkillEvolution {
 
   // ---- page assistance -----------------------------------------------------
 
-  private background(name: string, work: (signal: AbortSignal) => Promise<void>): void {
+  private background(name: string, work: (signal: AbortSignal) => Promise<void>): Promise<void> {
     const controller = new AbortController()
     this.jobs.add(controller)
-    void work(controller.signal).catch(error => this.warn(`${name} failed`, error)).finally(() => this.jobs.delete(controller))
+    return work(controller.signal).catch(error => this.warn(`${name} failed`, error)).finally(() => this.jobs.delete(controller))
   }
 
   /**
@@ -358,21 +394,11 @@ export class SkillEvolution {
    */
   async draft(port: SkillsSourcePort, workspace: string | undefined, input: { suggestionId?: string; skill?: string; guidance?: string; targetRoot?: SkillRootKind; route?: ModelRoute }): Promise<{ started: true; suggestionId?: string }> {
     const source = retryingSource(port)
-    const pack = await source.read<EvidencePack>('evidence-pack', { ...(input.suggestionId === undefined ? {} : { suggestionId: input.suggestionId }), ...(input.skill === undefined ? {} : { skill: input.skill }) })
-    // The evidence window contains only three recent drafts across this skill.
-    // Resolve this flow's own prior draft independently of that bounded context.
-    const previous = pack.suggestion?.draftId === undefined
-      ? (await source.read<SkillDraft[]>('drafts', { skill: pack.skillName, ...(input.suggestionId === undefined ? {} : { suggestionId: input.suggestionId }) })).find(draft => draft.suggestionId === input.suggestionId)
-      : (await source.read<DraftView>('draft', { id: pack.suggestion.draftId })).draft
-    // An improvement always keeps the file the Source loaded. For a creation,
-    // freeze one choice before model work and use it for both prompt and record.
-    const targetRoot = pack.action === 'update' ? pack.skill!.root
-      : newSkillRoot(this.host.settings(), source, await source.read<SkillCatalog>('catalog'), input.targetRoot ?? previous?.targetRoot ?? pack.suggestion?.targetRoot)
-    const guidance = [...(previous?.guidance ?? []), ...(input.guidance?.trim() ? [input.guidance.trim()] : [])].slice(-8)
+    const prepared = await this.prepareDraft(source, input)
     if (input.suggestionId !== undefined) await source.mutate('suggestion-status', { id: input.suggestionId, status: 'drafting' })
     this.background('skill draft', async signal => {
       try {
-        await this.writeDraft(source, workspace, input, { pack, targetRoot, guidance }, signal)
+        await this.writeDraft(source, workspace, input, prepared, signal)
       } catch (error) {
         if (input.suggestionId !== undefined) await source.mutate('suggestion-status', { id: input.suggestionId, status: 'pending', error: message(error) }).catch(() => undefined)
         throw error
@@ -381,7 +407,26 @@ export class SkillEvolution {
     return { started: true, ...(input.suggestionId === undefined ? {} : { suggestionId: input.suggestionId }) }
   }
 
-  private async writeDraft(source: SkillsSourcePort, workspace: string | undefined, input: { suggestionId?: string; skill?: string; guidance?: string; targetRoot?: SkillRootKind; route?: ModelRoute }, prepared: { pack: EvidencePack; targetRoot: SkillRootKind; guidance: string[] }, signal: AbortSignal): Promise<SkillDraft> {
+  /**
+   * Freeze a draft's evidence, destination and guidance before model work, so
+   * a manual draft and an automatic adoption resolve the same target root.
+   */
+  private async prepareDraft(source: SkillsSourcePort, input: { suggestionId?: string; skill?: string; guidance?: string; targetRoot?: SkillRootKind }, signal?: AbortSignal): Promise<{ pack: EvidencePack; targetRoot: SkillRootKind; guidance: string[] }> {
+    const pack = await source.read<EvidencePack>('evidence-pack', { ...(input.suggestionId === undefined ? {} : { suggestionId: input.suggestionId }), ...(input.skill === undefined ? {} : { skill: input.skill }) }, signal)
+    // The evidence window contains only three recent drafts across this skill.
+    // Resolve this flow's own prior draft independently of that bounded context.
+    const previous = pack.suggestion?.draftId === undefined
+      ? (await source.read<SkillDraft[]>('drafts', { skill: pack.skillName, ...(input.suggestionId === undefined ? {} : { suggestionId: input.suggestionId }) }, signal)).find(draft => draft.suggestionId === input.suggestionId)
+      : (await source.read<DraftView>('draft', { id: pack.suggestion.draftId }, signal)).draft
+    // An improvement always keeps the file the Source loaded. For a creation,
+    // freeze one choice before model work and use it for both prompt and record.
+    const targetRoot = pack.action === 'update' ? pack.skill!.root
+      : newSkillRoot(this.host.settings(), source, await source.read<SkillCatalog>('catalog', undefined, signal), input.targetRoot ?? previous?.targetRoot ?? pack.suggestion?.targetRoot)
+    const guidance = [...(previous?.guidance ?? []), ...(input.guidance?.trim() ? [input.guidance.trim()] : [])].slice(-8)
+    return { pack, targetRoot, guidance }
+  }
+
+  private async writeDraft(source: SkillsSourcePort, workspace: string | undefined, input: { suggestionId?: string; skill?: string; guidance?: string; targetRoot?: SkillRootKind; route?: ModelRoute }, prepared: { pack: EvidencePack; targetRoot: SkillRootKind; guidance: string[] }, signal: AbortSignal): Promise<{ draft: SkillDraft; candidate?: Promise<BacktestRun | undefined>; baseline?: Promise<BacktestRun | undefined> }> {
     const settings = this.host.settings()
     const { pack, targetRoot, guidance } = prepared
     let prompt = skillDraftPrompt(pack, guidance, targetRoot)
@@ -401,18 +446,83 @@ export class SkillEvolution {
         prompt += `\n\nYour previous SKILL.md was rejected: ${message(error)}. Return a corrected complete file.`
       }
     }
-    if (settings.autoBacktest && pack.cases.length > 0) {
-      await this.backtest(source, workspace, { skillName: pack.skillName, target: { kind: 'draft', draftId: draft.id }, ...(input.route === undefined ? {} : { route: input.route }) })
+    let candidate: Promise<BacktestRun | undefined> | undefined
+    let baseline: Promise<BacktestRun | undefined> | undefined
+    // An automatic adoption needs the comparison, so it runs the backtest even
+    // when the draft switch alone would leave it to a person.
+    if ((settings.autoBacktest || settings.autoAdopt) && pack.cases.length > 0) {
+      const started = await this.backtest(source, workspace, { skillName: pack.skillName, target: { kind: 'draft', draftId: draft.id }, ...(input.route === undefined ? {} : { route: input.route }) })
+      candidate = this.runs.get(started.runId)
       // Older runs do not record their model, so they cannot be a baseline for
       // an explicitly selected route even when the skill content is unchanged.
       const baselineKnown = input.route === undefined && pack.action === 'update' && pack.lastRun !== undefined && pack.lastRun.target.hash === pack.skill?.hash
-      if (baselineKnown) await source.mutate('run-link', { draftId: draft.id, runId: pack.lastRun!.id })
-      else {
-        const baseline = await this.backtest(source, workspace, { skillName: pack.skillName, target: { kind: pack.action === 'update' ? 'current' : 'none' }, ...(input.route === undefined ? {} : { route: input.route }) })
-        await source.mutate('run-link', { draftId: draft.id, runId: baseline.runId })
+      if (baselineKnown) {
+        await source.mutate('run-link', { draftId: draft.id, runId: pack.lastRun!.id })
+        baseline = source.read<BacktestRun>('run', { id: pack.lastRun!.id }, signal).catch(() => undefined)
+      } else {
+        const startedBaseline = await this.backtest(source, workspace, { skillName: pack.skillName, target: { kind: pack.action === 'update' ? 'current' : 'none' }, ...(input.route === undefined ? {} : { route: input.route }) })
+        await source.mutate('run-link', { draftId: draft.id, runId: startedBaseline.runId })
+        baseline = this.runs.get(startedBaseline.runId)
       }
     }
-    return draft
+    return { draft, ...(candidate === undefined ? {} : { candidate }), ...(baseline === undefined ? {} : { baseline }) }
+  }
+
+  /**
+   * Carry a review's suggestions all the way without a person: write each
+   * draft, run its backtest, redraft while the result regresses, then adopt.
+   * Turning the switch off stops the work; a draft that still regresses is
+   * left waiting for review.
+   */
+  private async autopilot(source: SkillsSourcePort, workspace: string | undefined, result: ReviewRecordResult, signal: AbortSignal): Promise<void> {
+    for (const id of result.suggestionIds) {
+      if (signal.aborted || !this.host.settings().autoAdopt) return
+      try { await this.autoAdopt(source, workspace, id, signal) } catch (error) {
+        if (!signal.aborted) this.warn('skill auto-adopt failed', error)
+      }
+    }
+  }
+
+  private async autoAdopt(source: SkillsSourcePort, workspace: string | undefined, suggestionId: string, signal: AbortSignal): Promise<void> {
+    const suggestion = (await source.read<SkillSuggestion[]>('suggestions', { status: ['pending', 'drafting', 'review'] }, signal)).find(entry => entry.id === suggestionId)
+    if (suggestion === undefined) return
+    if (suggestion.status === 'pending') await source.mutate('suggestion-status', { id: suggestion.id, status: 'drafting' }, signal)
+    else if (suggestion.status === 'review' && suggestion.draftId !== undefined) {
+      // A draft already waits; adopt it when its backtest still holds up.
+      const view = await source.read<DraftView>('draft', { id: suggestion.draftId }, signal)
+      if (view.draft.status === 'ready' && await this.adoptSound(source, view.draft, view.runs, signal)) return
+    }
+    let guidance: string | undefined
+    for (let attempt = 0; ; attempt++) {
+      if (signal.aborted || !this.host.settings().autoAdopt) return
+      const request = { suggestionId, ...(guidance === undefined ? {} : { guidance }) }
+      const { draft, candidate, baseline } = await this.writeDraft(source, workspace, request, await this.prepareDraft(source, request, signal), signal)
+      const compared = compareBacktestRuns(await baseline, await candidate)
+      if (signal.aborted || !this.host.settings().autoAdopt) return
+      if (draft.status !== 'ready') return
+      if (!compared.measured) {
+        // With no case to compare there is nothing to judge; a run that broke
+        // is not evidence either, so only the first case is adopted outright.
+        if (baseline === undefined && candidate === undefined) { await source.mutate('draft-adopt', { id: draft.id }, signal); return }
+        this.warn(`skill auto-adopt left ${draft.skillName} for review: its backtest did not finish`)
+        return
+      }
+      if (!compared.regressed) { await source.mutate('draft-adopt', { id: draft.id }, signal); return }
+      if (attempt >= AUTO_ADOPT_REDRAFTS) {
+        this.warn(`skill auto-adopt left ${draft.skillName} for review: ${compared.candidate!.toFixed(2)} against ${compared.baseline!.toFixed(2)}`)
+        return
+      }
+      guidance = `The backtest scored ${compared.candidate!.toFixed(2)} against ${compared.baseline!.toFixed(2)} for the current version. Keep everything the skill already does well while applying this change.`
+    }
+  }
+
+  /** Adopt a waiting draft whose finished backtest does not regress. */
+  private async adoptSound(source: SkillsSourcePort, draft: SkillDraft, runs: BacktestRun[], signal: AbortSignal): Promise<boolean> {
+    if (runs.length === 0) { await source.mutate('draft-adopt', { id: draft.id }, signal); return true }
+    const compared = compareBacktestRuns(runs.find(run => run.target.kind !== 'draft'), runs.find(run => run.target.kind === 'draft'))
+    if (!compared.measured || compared.regressed) return false
+    await source.mutate('draft-adopt', { id: draft.id }, signal)
+    return true
   }
 
   /** Start a backtest of one version of a skill against its enabled cases; it runs in the background. */
@@ -424,7 +534,7 @@ export class SkillEvolution {
     if (cases.some(entry => entry.requiresVision !== undefined && typeof entry.requiresVision !== 'boolean')) throw new Error('requiresVision must be a boolean')
     const resolved = await source.read<{ content?: string; target: RunTarget }>('target-content', { skillName: input.skillName, target: input.target })
     const run = await source.mutate<BacktestRun>('run-start', { skillName: input.skillName, target: resolved.target, caseIds: cases.map(entry => entry.id) })
-    this.background('skill backtest', async signal => {
+    const done = this.background('skill backtest', async signal => {
       try {
         // Record missing-input cases without asking either a model or a task Agent to guess.
         for (const entry of cases.filter(entry => entry.requiresVision === true)) {
@@ -451,6 +561,9 @@ export class SkillEvolution {
         throw error
       }
     })
+    this.runs.set(run.id, done.then(async () => {
+      try { return await source.read<BacktestRun>('run', { id: run.id }) } catch { return undefined }
+    }).finally(() => { this.runs.delete(run.id) }))
     return { runId: run.id }
   }
 

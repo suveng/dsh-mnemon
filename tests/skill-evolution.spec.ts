@@ -8,7 +8,7 @@ import * as generalStrategy from 'dsh-mnemon-strategy-general'
 import type { BacktestRun, EvalCase, EvidencePack, SkillCatalog, SkillDraft, SkillSuggestion, Trajectory } from 'dsh-mnemon-source-skills/contracts'
 import type { HostAgent, HostAgentContext, HostSessionEvent } from '../src/host/dsh.ts'
 import { DEFAULT_SKILLS_CONFIG, type ResolvedSkillsConfig } from '../src/host/protocol.ts'
-import { SkillEvolution, type SkillsSourcePort } from '../src/host/skill-evolution.ts'
+import { compareBacktestRuns, SkillEvolution, type SkillsSourcePort } from '../src/host/skill-evolution.ts'
 import { gradeCase, parseSkillDraft, parseSkillReview, renderSteps, skillDraftPrompt, skillReviewPrompt, SKILL_REVIEW_PERSONA } from '../src/host/skill-review.ts'
 import { captureTurn, redact, sessionTitle, TrajectoryWindow, turnSkillUses } from '../src/host/skill-trajectory.ts'
 import { sessionLog } from './fixtures/session-log.ts'
@@ -165,6 +165,10 @@ describe('skill evolution in the Host', () => {
     turn(events, number, text, tools)
     listeners.get('session/event')!(agent.session as never, events.at(-1) as never)
     await vi.advanceTimersByTimeAsync(0)
+  }
+
+  function updateReview(summary: string) {
+    return { outcome: 'suggest', summary, suggestions: [{ skillName: 'release-notes', action: 'update', summary, confidence: 0.9, steps: [1] }] }
   }
 
   function mixedReview() {
@@ -501,6 +505,107 @@ describe('skill evolution in the Host', () => {
     expect(view.runs.map(run => [run.target.kind, run.passRate])).toEqual([['draft', 1], ['current', 0]])
     await source.mutate('draft-adopt', { id: draft!.id })
     expect(readFileSync(join(directory, 'dsh', 'skills', 'release-notes', 'SKILL.md'), 'utf8')).toBe(next)
+  })
+
+  it('drafts, backtests and adopts a suggestion by itself when auto-adopt is on', async () => {
+    config = { ...config, evolution: true, autoAdopt: true, allowCreate: false }
+    await source.mutate('case-save', { case: { skillName: 'release-notes', title: 'Grouped notes', prompt: 'Write v2 notes', checks: [{ text: 'Grouped by component', must: true }] } })
+    const next = '---\nname: release-notes\ndescription: Write release notes grouped by component.\n---\n\n1. Read CHANGELOG.md\n2. Group by component\n'
+    const { skills, host } = evolution([])
+    host.skillTask.mockImplementation(async (_parent: HostAgent, label: string, prompt: string) => {
+      if (label === 'Mnemon skill review') return { structured: updateReview('Group by component') }
+      if (label === 'Mnemon skill draft') return { structured: { content: next, notes: '', changes: ['Group by component'] } }
+      if (label.startsWith('Mnemon skill eval')) return { structured: prompt.includes('Group by component') ? { steps: ['group'], answer: '## API' } : { steps: ['read'], answer: '- x' } }
+      const pass = prompt.includes('## API')
+      return { structured: { checks: [{ index: 1, pass, note: pass ? 'grouped' : 'flat' }], summary: pass ? 'good' : 'flat' } }
+    })
+    skills.watch(agent)
+    await endTurn(1, 'Group the release notes by component from now on.')
+    expect(await skills.reviewNow(agent)).toMatchObject({ inserted: 1 })
+    await vi.runAllTimersAsync()
+    await vi.waitFor(async () => expect(readFileSync(join(directory, 'dsh', 'skills', 'release-notes', 'SKILL.md'), 'utf8')).toBe(next))
+    expect((await source.read<SkillSuggestion[]>('suggestions'))[0]?.status).toBe('adopted')
+    expect((await source.read<SkillDraft[]>('drafts', { skill: 'release-notes' }))[0]).toMatchObject({ status: 'adopted', guidance: [] })
+    expect(host.warn).not.toHaveBeenCalled()
+  })
+
+  it('redraws a regressing draft with the comparison and adopts the better one', async () => {
+    config = { ...config, evolution: true, autoAdopt: true, allowCreate: false }
+    await source.mutate('case-save', { case: { skillName: 'release-notes', title: 'Grouped notes', prompt: 'Write v2 notes', checks: [{ text: 'Grouped by component', must: true }] } })
+    const regressed = '---\nname: release-notes\ndescription: REGRESS grouped notes.\n---\n\n1. Group by component\n'
+    const good = '---\nname: release-notes\ndescription: Write release notes grouped by component.\n---\n\n1. Read CHANGELOG.md\n2. Group by component\n'
+    const prompts: string[] = []
+    const { skills, host } = evolution([])
+    host.skillTask.mockImplementation(async (_parent: HostAgent, label: string, prompt: string) => {
+      if (label === 'Mnemon skill review') return { structured: updateReview('Group by component') }
+      if (label === 'Mnemon skill draft') {
+        prompts.push(prompt)
+        return { structured: { content: prompts.length === 1 ? regressed : good, notes: '', changes: [] } }
+      }
+      if (label.startsWith('Mnemon skill eval')) {
+        const answer = prompt.includes('REGRESS') ? 'flat list' : '## API'
+        return { structured: { steps: ['write'], answer } }
+      }
+      const pass = prompt.includes('## API')
+      return { structured: { checks: [{ index: 1, pass, note: pass ? 'grouped' : 'flat' }], summary: pass ? 'good' : 'flat' } }
+    })
+    skills.watch(agent)
+    await endTurn(1, 'Group the release notes by component from now on.')
+    expect(await skills.reviewNow(agent)).toMatchObject({ inserted: 1 })
+    await vi.runAllTimersAsync()
+    await vi.waitFor(async () => expect(readFileSync(join(directory, 'dsh', 'skills', 'release-notes', 'SKILL.md'), 'utf8')).toBe(good))
+    expect(prompts).toHaveLength(2)
+    expect(prompts[1]).toContain('The backtest scored 0.00 against 1.00')
+    expect(prompts[1]).toContain('Keep everything the skill already does well')
+    expect((await source.read<SkillSuggestion[]>('suggestions'))[0]?.status).toBe('adopted')
+    expect(host.warn).not.toHaveBeenCalled()
+  })
+
+  it('stops rewriting after two attempts and leaves a still-regressing draft for review', async () => {
+    config = { ...config, evolution: true, autoAdopt: true, allowCreate: false }
+    await source.mutate('case-save', { case: { skillName: 'release-notes', title: 'Grouped notes', prompt: 'Write v2 notes', checks: [{ text: 'Grouped by component', must: true }] } })
+    const regressed = '---\nname: release-notes\ndescription: REGRESS grouped notes.\n---\n\n1. Group by component\n'
+    let drafts = 0
+    const { skills, host } = evolution([])
+    host.skillTask.mockImplementation(async (_parent: HostAgent, label: string, prompt: string) => {
+      if (label === 'Mnemon skill review') return { structured: updateReview('Group by component') }
+      if (label === 'Mnemon skill draft') { drafts += 1; return { structured: { content: regressed, notes: '', changes: [] } } }
+      if (label.startsWith('Mnemon skill eval')) return { structured: { steps: ['write'], answer: prompt.includes('REGRESS') ? 'flat list' : '## API' } }
+      const pass = prompt.includes('## API')
+      return { structured: { checks: [{ index: 1, pass, note: pass ? 'grouped' : 'flat' }], summary: pass ? 'good' : 'flat' } }
+    })
+    skills.watch(agent)
+    await endTurn(1, 'Group the release notes by component from now on.')
+    expect(await skills.reviewNow(agent)).toMatchObject({ inserted: 1 })
+    await vi.runAllTimersAsync()
+    await vi.waitFor(async () => expect(drafts).toBe(3))
+    expect(readFileSync(join(directory, 'dsh', 'skills', 'release-notes', 'SKILL.md'), 'utf8')).toBe('---\nname: release-notes\ndescription: Write release notes from a changelog.\n---\n\n1. Read CHANGELOG.md\n')
+    expect((await source.read<SkillSuggestion[]>('suggestions'))[0]?.status).toBe('review')
+    expect((await source.read<SkillDraft[]>('drafts', { skill: 'release-notes' }))[0]?.status).toBe('ready')
+    expect(host.warn.mock.calls.some(call => String(call[0]).includes('left release-notes for review'))).toBe(true)
+  })
+
+  it('leaves suggestions waiting when auto-adopt is off', async () => {
+    config = { ...config, evolution: true }
+    await source.mutate('case-save', { case: { skillName: 'release-notes', title: 'Grouped notes', prompt: 'Write v2 notes', checks: [{ text: 'Grouped by component', must: true }] } })
+    const { skills, host } = evolution([() => updateReview('Group by component')])
+    skills.watch(agent)
+    await endTurn(1, 'Group the release notes by component from now on.')
+    expect(await skills.reviewNow(agent)).toMatchObject({ inserted: 1 })
+    await vi.runAllTimersAsync()
+    expect(await source.read('drafts', { skill: 'release-notes' })).toHaveLength(0)
+    expect((await source.read<SkillSuggestion[]>('suggestions'))[0]?.status).toBe('pending')
+    expect(host.skillTask.mock.calls.map(call => call[1])).toEqual(['Mnemon skill review'])
+  })
+
+  it('compares runs only over the cases both graded', () => {
+    const results = (entries: Array<[string, 'pass' | 'fail' | 'error', number]>) => entries.map(([caseId, verdict, score]) => ({ caseId, title: caseId, verdict, score, checks: [], steps: [], answer: '' }))
+    const baseline = { status: 'completed', results: results([['a', 'pass', 1], ['b', 'error', 0]]) } as unknown as BacktestRun
+    const candidate = { status: 'completed', results: results([['a', 'fail', 0], ['b', 'pass', 1]]) } as unknown as BacktestRun
+    expect(compareBacktestRuns(baseline, candidate)).toEqual({ baseline: 1, candidate: 0, excluded: 1, measured: true, regressed: true })
+    expect(compareBacktestRuns({ ...baseline, status: 'failed' }, candidate)).toMatchObject({ measured: false, regressed: false })
+    expect(compareBacktestRuns(baseline, { ...candidate, results: results([['b', 'pass', 1]]) })).toMatchObject({ excluded: 2, measured: false })
+    expect(compareBacktestRuns(baseline, { ...candidate, results: results([['a', 'pass', 1]]) })).toMatchObject({ excluded: 1, measured: true, regressed: false })
   })
 
   it.each([false, true])('uses a fresh comparison baseline when a draft picks a model (picked=%s)', async picked => {

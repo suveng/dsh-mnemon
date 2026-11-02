@@ -410,6 +410,8 @@ export interface ResolvedSkillsConfig {
   targetScope: 'storage' | 'user' | 'project'
   /** Backtest a draft against the current version as soon as it is written. */
   autoBacktest: boolean
+  /** Carry a suggestion all the way: draft it, backtest, improve while it regresses, and adopt it. */
+  autoAdopt: boolean
   /** The one-line skills bar under a finished turn. */
   hints: boolean
   /** 技能管理 as a sidebar entry of its own instead of a Memory System page. */
@@ -436,6 +438,7 @@ export const DEFAULT_SKILLS_CONFIG: Readonly<ResolvedSkillsConfig> = Object.free
   allowUpdate: true,
   targetScope: 'user',
   autoBacktest: true,
+  autoAdopt: false,
   hints: true,
   sidebar: false,
   reviewThreshold: 5,

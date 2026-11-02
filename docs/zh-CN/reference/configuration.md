@@ -365,6 +365,7 @@ DSH 的实时模型目录会报告各模型的输入模态，选择器为支持�
 | `skills.allowUpdate` | `true` | boolean | **改进已有技能**：允许复盘提出已有技能的改进 |
 | `skills.targetScope` | `user` | `storage` / `user` / `project` | **新技能写入位置**：`user` → `user-dsh`；`project` → `project-dsh`；`storage` 跟随 `storageScope`（`global` / `custom` → 用户，`workspace` / `workspaces` → 项目）。设置页面支持应用或放弃 |
 | `skills.autoBacktest` | `true` | boolean | **草案自动回测**：草案写好后用测试用例与当前版本对比 |
+| `skills.autoAdopt` | `false` | boolean | **全自动采纳**：建议出现后自动起草、回测、按需重写并采纳，不再等人确认；回测比当前版本差时最多重写两次，仍未改善则留下草案等你处理 |
 | `skills.hints` | `true` | boolean | **对话提示**：在每个回合下方显示**本回合技能** |
 | `skills.sidebar` | `false` | boolean | **侧边栏入口**：技能管理单独显示在侧边栏，不再放在记忆系统里 |
 | `skills.reviewThreshold` | `5` | 1–50 | **复盘阈值**：对话窗口的活动积分达到它才会复盘 |

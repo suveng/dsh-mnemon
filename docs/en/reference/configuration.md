@@ -365,6 +365,7 @@ Skills keeps its settings under `skills` in the `mnemon` entry, edited on its ow
 | `skills.allowUpdate` | `true` | boolean | **Suggest skill improvements**: allow reviews to improve existing skills |
 | `skills.targetScope` | `user` | `storage` / `user` / `project` | **New skill destination**: `user` → `user-dsh`; `project` → `project-dsh`; `storage` follows `storageScope` (`global` / `custom` → user, `workspace` / `workspaces` → project). Apply or Discard on the settings page |
 | `skills.autoBacktest` | `true` | boolean | **Backtest drafts**: compare each new draft with the current version on its test cases |
+| `skills.autoAdopt` | `false` | boolean | **Adopt automatically**: draft, backtest, rewrite while it regresses and adopt each suggestion without asking. It rewrites at most twice, then leaves a still-regressing draft for you |
 | `skills.hints` | `true` | boolean | **In the conversation**: the **Turn skills** line under each turn |
 | `skills.sidebar` | `false` | boolean | **Sidebar entry**: Skills as its own sidebar entry, out of the Memory System |
 | `skills.reviewThreshold` | `5` | 1–50 | **Review threshold**: the activity score a conversation's window must reach before a review |
