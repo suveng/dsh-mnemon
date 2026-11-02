@@ -319,6 +319,22 @@ describe('skill evolution in the Host', () => {
     stop()
   })
 
+  it('keeps the review window when DSH recreates the conversation Agent', async () => {
+    config = { ...config, evolution: true, reviewThreshold: 10, idleSeconds: 3600 }
+    const { skills } = evolution([])
+    const stop = skills.watch(agent)
+    await endTurn(1, 'Capture incident logs and group release notes by component.', [{ name: 'bash', args: {} }])
+    const first = skills.pending('session-1')
+    expect(first).toMatchObject({ turns: 1 })
+    stop()
+    // DSH gives a resumed or compacted conversation a new Agent with the same id.
+    const resumed = skills.watch(agent)
+    await endTurn(2, 'Group them by component from now on.', [{ name: 'bash', args: {} }])
+    expect(skills.pending('session-1')).toMatchObject({ turns: 2 })
+    expect(skills.pending('session-1')!.score).toBeGreaterThan(first!.score)
+    resumed()
+  })
+
   it.each([
     { allowCreate: true, allowUpdate: true },
     { allowCreate: true, allowUpdate: false },

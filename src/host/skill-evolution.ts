@@ -43,6 +43,8 @@ interface SessionState {
   reviewing?: number
   lastReviewAt?: number
   failures: number
+  /** When this conversation last finished a turn, for pruning idle windows. */
+  touched?: number
 }
 
 /** A conversation's turn bars read at most this many of its reviews. */
@@ -51,6 +53,12 @@ const WAITING_STATUSES: ReadonlySet<string> = new Set(['pending', 'drafting', 'r
 
 /** A session stops reviewing after this many failures in a row, until DSH recreates its Agent. */
 const MAX_CONSECUTIVE_FAILURES = 3
+/**
+ * How many conversations keep their window while their Agent is unloaded.
+ * DSH replaces a conversation's Agent on resume, clear and compaction, and the
+ * window belongs to the conversation rather than to that object.
+ */
+const RETAINED_SESSIONS = 64
 /** Backtest children run this many cases at once. */
 /** One retry for a case whose run failed rather than scored. */
 const CASE_ATTEMPTS = 2
@@ -179,12 +187,32 @@ export class SkillEvolution {
     if (state === undefined) {
       state = { window: new TrajectoryWindow(), failures: 0 }
       this.sessions.set(agent.id, state)
+      this.pruneSessions()
     }
     return state
   }
 
+  /** Bound the windows kept for conversations whose Agents are not loaded right now. */
+  private pruneSessions(): void {
+    if (this.sessions.size <= RETAINED_SESSIONS) return
+    const idle = [...this.sessions.entries()]
+      .filter(([, state]) => state.running === undefined && state.timer === undefined)
+      .sort((left, right) => (left[1].touched ?? 0) - (right[1].touched ?? 0))
+    for (const [id] of idle) {
+      if (this.sessions.size <= RETAINED_SESSIONS) break
+      this.sessions.delete(id)
+    }
+  }
+
   /** Observe one root conversation Agent; the returned function stops observing it. */
   watch(agent: HostAgent): () => void {
+    // A recreated Agent is the same conversation: the window and the last
+    // review stay, only the failure streak that paused reviews starts over.
+    const kept = this.sessions.get(agent.id)
+    if (kept !== undefined) {
+      kept.failures = 0
+      kept.touched = Date.now()
+    }
     const stops = [
       agent.ctx.on('session/event', ((session: HostAgent['session'], event: HostSessionEvent) => {
         if (session !== agent.session || event.type !== 'turn/end' || typeof event.data.turn !== 'number') return
@@ -198,8 +226,8 @@ export class SkillEvolution {
     ]
     return () => {
       for (const stop of stops) stop()
+      // The timer belongs to the Agent that would have run it; the window does not.
       this.cancelTimer(agent.id)
-      this.sessions.delete(agent.id)
     }
   }
 
@@ -224,6 +252,7 @@ export class SkillEvolution {
     if (captured === undefined || captured.steps.length === 0) return
     const state = this.state(agent)
     if (state.failures >= MAX_CONSECUTIVE_FAILURES) return
+    state.touched = this.now().getTime()
     state.window.add(captured, this.now())
     this.schedule(agent, state, settings)
   }
